@@ -32,6 +32,10 @@ requirements = {
             "loguru",
             # config
             "tomli",
+            # MiniLM2
+            "modelscope",
+            # Bilibili Chat
+            "bilibili-api"
         ],
         "linux": [
             # tts

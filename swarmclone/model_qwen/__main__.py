@@ -7,9 +7,15 @@ import re
 import uuid
 import time
 from enum import Enum
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer, StoppingCriteriaList, StoppingCriteria # type: ignore
+from transformers import ( # type: ignore
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    TextIteratorStreamer,
+    StoppingCriteriaList,
+    StoppingCriteria
+)
 
-from . import qwen2_config
+from . import tokenizer, model, classifier_model, classifier_tokenizer
 from ..request_parser import *
 from ..config import config
 
@@ -49,6 +55,40 @@ def split_text(s, separators="。？！～.?!~\n\r"): # By DeepSeek
             result.append(last_cleaned)
     
     return result
+
+def get_emotion(text: str) -> EmotionType:
+    ids = classifier_tokenizer([text], return_tensors="pt").input_ids.to(classifier_model.device)
+    logits = classifier_model(input_ids=ids).logits
+    neutral, like, sad, disgust, anger, happy = logits.tolist()[0]
+    return {
+        'like': like,
+        'disgust': disgust,
+        'anger': anger,
+        'happy': happy,
+        'sad': sad,
+        'neutral': neutral
+    }
+
+def build_msg(
+        content: str,
+        emotion: EmotionType = {
+            'like': 0,
+            'disgust': 0,
+            'anger': 0,
+            'happy': 0,
+            'sad': 0,
+            'neutral': 1.0 # 无感情占位符
+        }):
+    print(f"build_msg: {content}, {emotion}")
+    return {
+        'from': 'llm',
+        'type': 'data',
+        'payload': {
+            'content': content,
+            'id': str(uuid.uuid4()),
+            'emotion': emotion
+        }
+    }
 
 q_recv: queue.Queue[RequestType] = queue.Queue()
 def recv_msg(sock: socket.socket, q: queue.Queue[RequestType], stop_module: threading.Event):
@@ -97,26 +137,6 @@ stop_generation = threading.Event()
 stop_module = threading.Event()
 
 if __name__ == '__main__':
-    successful = False
-    abs_model_path = os.path.expanduser(qwen2_config.MODEL_PATH)
-    while not successful:
-        try:
-            print(f"正在从{abs_model_path}加载模型……")
-            model = AutoModelForCausalLM.from_pretrained(abs_model_path, torch_dtype="auto", device_map="auto")
-            tokenizer = AutoTokenizer.from_pretrained(abs_model_path, padding_side="left")
-            successful = True
-        except Exception as e:
-            print(e)
-            choice = input("加载模型失败，是否下载模型？(Y/n)")
-            if choice.lower() != "n":
-                import huggingface_hub # type: ignore
-                huggingface_hub.snapshot_download(
-                    repo_id=qwen2_config.MODEL_ID,
-                    repo_type="model",
-                    local_dir=abs_model_path,
-                    endpoint="https://hf-mirror.com"
-                )
-    
     streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.connect((config.panel.server.host, config.llm.port))
@@ -138,6 +158,7 @@ if __name__ == '__main__':
             time.sleep(0.1) # 防止CPU占用过高
 
         history: list[dict[str, str]] = []
+        chat_messages: list[tuple[str, str]] = []
         state: States = States.STANDBY
         text = "" # 尚未发送的文本
         full_text = "" # 一轮生成中的所有文本
@@ -157,7 +178,8 @@ if __name__ == '__main__':
             等待ASR状态：
             - 若收到ASR给出的语音识别信息，切换到生成状态
             """
-            print(message)
+            if message is not None:
+                print(message)
             if message_consumed:
                 try:
                     message = q_recv.get(False)
@@ -167,116 +189,100 @@ if __name__ == '__main__':
                         continue
                 except queue.Empty:
                     message = None
-            match state:
-                case States.STANDBY:
-                    if time.time() - standby_time > 1000000:
-                        stop_generation.clear()
-                        history.append({'role': 'user', 'content': '请随便说点什么吧！'})
-                        kwargs = {"model": model, "text_inputs": history, "streamer": streamer}
-                        generation_thread = threading.Thread(target=generate, kwargs=kwargs)
-                        generation_thread.start()
-                        state = States.GENERATE
-                        text = ""
-                    if message == ASR_ACTIVATE:
-                        state = States.WAIT_FOR_ASR
-                        message_consumed = True
 
-                case States.GENERATE:
-                    try:
-                        text += next(streamer)
-                    except StopIteration: # 生成完毕
-                        # 停止生成
-                        stop_generation.set()
-                        if generation_thread is not None and generation_thread.is_alive():
-                            generation_thread.join()
-                        # 处理剩余的文本
-                        if text.strip():
-                            q_send.put({
-                                'from': 'llm',
-                                'type': 'data',
-                                'payload': {
-                                    'content': text,
-                                    'id': str(uuid.uuid4()),
-                                    'emotion': {
-                                        'like': 0,
-                                        'disgust': 0,
-                                        'anger': 0,
-                                        'happy': 0,
-                                        'sad': 0,
-                                        'neutral': 1.0
-                                    } # 占位符
-                                }
-                            })
-                        full_text += text
-                        # 将这轮的生成文本加入历史记录
-                        history.append({'role': 'llm', 'content': full_text})
-                        # 发出信号并等待TTS
-                        q_send.put(LLM_EOS)
-                        state = States.WAIT_FOR_TTS
-                        text = ""
-                        full_text = ""
-                        continue
-                    if message == ASR_ACTIVATE:
-                        # 停止生成
-                        stop_generation.set()
-                        if generation_thread is not None and generation_thread.is_alive():
-                            generation_thread.join()
-                        for _ in streamer:... # 跳过剩余的文本
-                        # 将这轮的生成文本加入历史记录
-                        history.append({'role': 'llm', 'content': full_text})
-                        # 发出信号并等待ASR
-                        q_send.put(LLM_EOS)
-                        state = States.WAIT_FOR_ASR
-                        text = ""
-                        full_text = ""
-                        message_consumed = True
-                        continue
-                    print(text)
-                    if text.strip(): # 防止文本为空导致报错
-                        *sentences, text = split_text(text) # 将所有完整的句子发送
-                        for i, sentence in enumerate(sentences):
-                            q_send.put({
-                                'from': 'llm',
-                                'type': 'data',
-                                'payload': {
-                                    'content': sentence,
-                                    'id': str(uuid.uuid4()),
-                                    'emotion': {
-                                        'like': 0,
-                                        'disgust': 0,
-                                        'anger': 0,
-                                        'happy': 0,
-                                        'sad': 0,
-                                        'neutral': 1.0
-                                    } # 占位符
-                                }
-                            })
+            if state == States.STANDBY:
+                if time.time() - standby_time > 10 and chat_messages:
+                    stop_generation.clear()
+                    history += [{'role': 'chat', 'content': f"{name}：{content}"} for name, content in chat_messages]
+                    chat_messages.clear()
+                    kwargs = {"model": model, "text_inputs": history, "streamer": streamer}
+                    generation_thread = threading.Thread(target=generate, kwargs=kwargs)
+                    generation_thread.start()
+                    state = States.GENERATE
+                    text = ""
+                if message == ASR_ACTIVATE:
+                    state = States.WAIT_FOR_ASR
+                    message_consumed = True
+
+            elif state == States.GENERATE:
+                try:
+                    text += next(streamer)
+                except StopIteration: # 生成完毕
+                    # 停止生成
+                    stop_generation.set()
+                    if generation_thread is not None and generation_thread.is_alive():
+                        generation_thread.join()
+                    # 处理剩余的文本
+                    if stripped_text := text.strip():
+                        emotion = get_emotion(stripped_text)
+                        q_send.put(build_msg(stripped_text, emotion))
+                    full_text += text
+                    # 将这轮的生成文本加入历史记录
+                    history.append({'role': 'assistant', 'content': full_text.strip()})
+                    # 发出信号并等待TTS
+                    q_send.put(LLM_EOS)
+                    state = States.WAIT_FOR_TTS
+                    text = ""
+                    full_text = ""
                     continue
+                if message == ASR_ACTIVATE:
+                    # 停止生成
+                    stop_generation.set()
+                    if generation_thread is not None and generation_thread.is_alive():
+                        generation_thread.join()
+                    for _ in streamer:... # 跳过剩余的文本
+                    # 将这轮的生成文本加入历史记录
+                    history.append({'role': 'assistant', 'content': full_text.strip()})
+                    # 发出信号并等待ASR
+                    q_send.put(LLM_EOS)
+                    state = States.WAIT_FOR_ASR
+                    text = ""
+                    full_text = ""
+                    message_consumed = True
+                    continue
+                if text.strip(): # 防止文本为空导致报错
+                    *sentences, text = split_text(text) # 将所有完整的句子发送
+                    for i, sentence in enumerate(sentences):
+                        emotion = get_emotion(sentence)
+                        q_send.put(build_msg(sentence, emotion))
 
-                case States.WAIT_FOR_ASR:
-                    if     (message is not None and
-                            message['from'] == 'asr' and
-                            message['type'] == 'data' and
-                            isinstance(message['payload'], dict) and
-                            isinstance(message['payload']['content'], str)):
-                        message_consumed = True
-                        stop_generation.clear()
-                        history.append({'role': 'user', 'content': message['payload']['content']})
-                        kwargs = {"model": model, "text_inputs": history, "streamer": streamer}
-                        generation_thread = threading.Thread(target=generate, kwargs=kwargs)
-                        generation_thread.start()
-                        state = States.GENERATE
-                        text = ""
-                        continue
+            elif state == States.WAIT_FOR_ASR:
+                if     (message is not None and
+                        message['from'] == 'asr' and
+                        message['type'] == 'data' and
+                        isinstance(message['payload'], dict) and
+                        isinstance(message['payload']['content'], str)):
+                    message_consumed = True
+                    stop_generation.clear()
+                    history += [{'role': 'chat', 'content': f"{name}：{content}"} for name, content in chat_messages]
+                    chat_messages.clear()
+                    history.append({'role': 'user', 'content': message['payload']['content']})
+                    kwargs = {"model": model, "text_inputs": history, "streamer": streamer}
+                    generation_thread = threading.Thread(target=generate, kwargs=kwargs)
+                    generation_thread.start()
+                    state = States.GENERATE
+                    text = ""
+                elif message == ASR_ACTIVATE:
+                    message_consumed = True # 已经激活的不需要再激活一次
+                
+            elif state == States.WAIT_FOR_TTS:
+                if message == TTS_FINISH:
+                    state = States.STANDBY
+                    standby_time = time.time()
+                    message_consumed = True
+                if message == ASR_ACTIVATE:
+                    state = States.WAIT_FOR_ASR
+                    message_consumed = True
 
-                case States.WAIT_FOR_TTS:
-                    if message == TTS_FINISH:
-                        state = States.STANDBY
-                        standby_time = time.time()
-                        message_consumed = True
-                    if message == ASR_ACTIVATE:
-                        state = States.WAIT_FOR_ASR
-                        message_consumed = True
+            if (message is not None and
+                message['from'] == 'chat' and
+                message['type'] == 'data' and
+                isinstance(message['payload'], dict) and
+                isinstance(message['payload']['user'], str) and
+                isinstance(message['payload']['content'], str)):
+                chat_messages.append((message['payload']['user'], message['payload']['content']))
+                message_consumed = True
+
             if message is not None and message == PANEL_STOP:
                 stop_generation.set()
                 stop_module.set()
